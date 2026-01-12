@@ -12,9 +12,9 @@
 //! # Example
 //!
 //! ```no_run
-//! use asus_display_control::{AsusController, DisplayController, NormalMode, EyeCareMode};
+//! use azizo_core::{AsusController, DisplayController, NormalMode, EyeCareMode};
 //!
-//! fn main() -> Result<(), asus_display_control::ControllerError> {
+//! fn main() -> Result<(), azizo_core::ControllerError> {
 //!     // Create the controller (only one instance allowed)
 //!     let controller = AsusController::new()?;
 //!
@@ -46,7 +46,7 @@
 //! Use [`MockController`] to test code without hardware:
 //!
 //! ```
-//! use asus_display_control::{MockController, DisplayController, NormalMode};
+//! use azizo_core::{MockController, DisplayController, NormalMode};
 //!
 //! let mock = MockController::new();
 //! mock.set_mode(&NormalMode::new()).unwrap();

@@ -1,11 +1,6 @@
-# asus-display-control
+# azizo-core
 
 Unofficial Rust API for ASUS Splendid display control on Windows.
-
-## Disclaimer
-
-This is an **unofficial** library. It is not affiliated with or endorsed by ASUS.
-Use at your own risk.
 
 ## Requirements
 
@@ -19,9 +14,9 @@ Use at your own risk.
 ## Usage
 
 ```rust
-use asus_display_control::{AsusController, DisplayController, NormalMode, EyeCareMode};
+use azizo_core::{AsusController, DisplayController, NormalMode, EyeCareMode};
 
-fn main() -> Result<(), asus_display_control::ControllerError> {
+fn main() -> Result<(), azizo_core::ControllerError> {
     // Create the controller (only one instance allowed)
     let controller = AsusController::new()?;
 
@@ -63,7 +58,7 @@ fn main() -> Result<(), asus_display_control::ControllerError> {
 Use `MockController` to test without hardware:
 
 ```rust
-use asus_display_control::{MockController, DisplayController, NormalMode};
+use azizo_core::{MockController, DisplayController, NormalMode};
 
 let mock = MockController::new();
 mock.set_mode(&NormalMode::new()).unwrap();

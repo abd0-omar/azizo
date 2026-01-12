@@ -1,16 +1,20 @@
 [package]
-name = "asus-display-control"
+name = "azizo-core"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.92"
 description = "Unofficial Rust API for ASUS Splendid display control"
 license = "MIT OR Apache-2.0"
+homepage = "https://github.com/abd0-omar/azizo"
+repository = "https://github.com/abd0-omar/azizo"
+documentation = "https://docs.rs/azizo-core"
 keywords = ["asus", "display", "windows", "hardware", "splendid"]
 categories = ["hardware-support", "os::windows-apis"]
 readme = "README.md"
 exclude = ["target/", "*.dll"]
 
 [lib]
-name = "asus_display_control"
+name = "azizo_core"
 path = "src/lib.rs"
 
 [[example]]
@@ -22,8 +26,8 @@ libloading = "0.9.0"
 log = "0.4.29"
 thiserror = "2.0"
 windows-sys = { version = "0.61.2", features = [
-    "Win32",
-    "Win32_Storage_Packaging_Appx",
+  "Win32",
+  "Win32_Storage_Packaging_Appx",
 ] }
 
 [dev-dependencies]

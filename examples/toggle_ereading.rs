@@ -2,7 +2,7 @@
 //!
 //! Run with: `cargo run --example toggle_ereading`
 
-use asus_display_control::{AsusController, ControllerError, DisplayController};
+use azizo_core::{AsusController, ControllerError, DisplayController};
 
 fn main() -> Result<(), ControllerError> {
     // Initialize logging (optional)
