@@ -1,0 +1,13 @@
+[package]
+name = "azizo"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "ASUS Splendid display control GUI application"
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/abd0-omar/azizo"
+repository = "https://github.com/abd0-omar/azizo"
+
+[dependencies]
+azizo-core = { path = "../azizo-core" }
+iced = "0.14.0"
