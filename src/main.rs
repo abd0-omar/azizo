@@ -6,10 +6,10 @@ use windows_sys::Win32::{
 };
 
 use libloading::{Library, Symbol};
-use log::{debug, info, trace};
+use log::{debug, info};
 use std::ffi::c_void;
 use std::fs;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const LOCAL_DLL_NAME: &str = "AsusCustomizationRpcClient.dll";
 
@@ -31,6 +31,9 @@ pub enum ControllerError {
     #[error("RPC initialization failed")]
     RpcInitFailed,
 
+    #[error("Controller already initialized - only one instance allowed")]
+    AlreadyInitialized,
+
     #[error("Invalid slider value {value} for {mode} (expected {min}-{max})")]
     InvalidSliderValue {
         mode: &'static str,
@@ -50,77 +53,158 @@ pub enum ControllerError {
 }
 
 // =============================================================================
-// Global Callback State
+// Controller State (snapshot of current values)
 // =============================================================================
 
-static CURRENT_MODE: AtomicI32 = AtomicI32::new(-1);
-static IS_MONOCHROME: AtomicBool = AtomicBool::new(false);
-static LAST_NON_EREADING_MODE: AtomicI32 = AtomicI32::new(1); // Default to Normal
+/// A snapshot of the controller's current state.
+/// This captures all slider/mode values at a point in time.
+#[derive(Debug, Clone, Default)]
+pub struct ControllerState {
+    pub mode_id: i32,
+    pub is_monochrome: bool,
+    pub dimming: i32,
+    pub manual_slider: u8,
+    pub eyecare_level: u8,
+    pub ereading_grayscale: u8,
+    pub ereading_temp: u8,
+    pub last_non_ereading_mode: i32,
+}
 
-static MANUAL_SLIDER: AtomicI32 = AtomicI32::new(50); // Default middle
-static EYECARE_SLIDER: AtomicI32 = AtomicI32::new(2); // Default level
-static EREADING_GRAYSCALE: AtomicI32 = AtomicI32::new(3); // Default grayscale 3
-static EREADING_TEMP: AtomicI32 = AtomicI32::new(562); // Default temp
-static CURRENT_DIMMING: AtomicI32 = AtomicI32::new(-1); // Dimming level (40-100)
+// =============================================================================
+// Display Controller Trait
+// =============================================================================
 
-extern "C" fn mode_callback(func: i32, data: i32, str_data: *const i8) {
-    let s = if str_data.is_null() {
-        String::from("null")
-    } else {
-        unsafe {
-            std::ffi::CStr::from_ptr(str_data)
-                .to_string_lossy()
-                .to_string()
+/// Trait for display controller implementations.
+/// This allows for mock implementations in tests.
+pub trait DisplayController: Send + Sync {
+    /// Get a snapshot of the current controller state
+    fn get_state(&self) -> ControllerState;
+
+    /// Refresh slider values from the device
+    fn refresh_sliders(&self) -> Result<(), ControllerError>;
+
+    /// Sync all slider values from hardware
+    fn sync_all_sliders(&self) -> Result<(), ControllerError>;
+
+    /// Set the display dimming level (40-100)
+    fn set_dimming(&self, level: i32) -> Result<(), ControllerError>;
+
+    /// Set dimming using percentage (0-100)
+    fn set_dimming_percent(&self, percent: i32) -> Result<(), ControllerError>;
+
+    /// Get the current display mode
+    fn get_current_mode(&self) -> Result<Box<dyn DisplayMode>, ControllerError>;
+
+    /// Set a display mode
+    fn set_mode(&self, mode: &dyn DisplayMode) -> Result<(), ControllerError>;
+
+    /// Toggle e-reading mode on/off
+    fn toggle_e_reading(&self) -> Result<Box<dyn DisplayMode>, ControllerError>;
+}
+
+// =============================================================================
+// Callback State (private module with globals)
+// =============================================================================
+
+mod callback_state {
+    use super::ControllerState;
+    use log::{debug, trace};
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+
+    static CURRENT_MODE: AtomicI32 = AtomicI32::new(-1);
+    static IS_MONOCHROME: AtomicBool = AtomicBool::new(false);
+    static LAST_NON_EREADING_MODE: AtomicI32 = AtomicI32::new(1); // Default to Normal
+
+    static MANUAL_SLIDER: AtomicI32 = AtomicI32::new(50); // Default middle
+    static EYECARE_SLIDER: AtomicI32 = AtomicI32::new(2); // Default level
+    static EREADING_GRAYSCALE: AtomicI32 = AtomicI32::new(3); // Default grayscale 3
+    static EREADING_TEMP: AtomicI32 = AtomicI32::new(562); // Default temp
+    static CURRENT_DIMMING: AtomicI32 = AtomicI32::new(-1); // Dimming level (40-100)
+
+    /// Get a snapshot of all current state values
+    pub(super) fn snapshot() -> ControllerState {
+        ControllerState {
+            mode_id: CURRENT_MODE.load(Ordering::SeqCst),
+            is_monochrome: IS_MONOCHROME.load(Ordering::SeqCst),
+            dimming: CURRENT_DIMMING.load(Ordering::SeqCst),
+            manual_slider: MANUAL_SLIDER.load(Ordering::SeqCst) as u8,
+            eyecare_level: EYECARE_SLIDER.load(Ordering::SeqCst) as u8,
+            ereading_grayscale: EREADING_GRAYSCALE.load(Ordering::SeqCst) as u8,
+            ereading_temp: EREADING_TEMP.load(Ordering::SeqCst) as u8,
+            last_non_ereading_mode: LAST_NON_EREADING_MODE.load(Ordering::SeqCst),
         }
-    };
+    }
 
-    trace!("callback: func={}, data={}, str='{}'", func, data, s);
+    /// Store the last non-e-reading mode
+    pub(super) fn store_last_non_ereading_mode(mode_id: i32) {
+        LAST_NON_EREADING_MODE.store(mode_id, Ordering::SeqCst);
+    }
 
-    match func {
-        // Mode info callback
-        18 => {
-            // Parse "0_1_0_1_1,70,0" -> dimming is 2nd field, monochrome is 3rd field
-            let parts: Vec<&str> = s.split(',').collect();
-            if parts.len() >= 2 {
-                if let Ok(dimming) = parts[1].parse::<i32>() {
-                    CURRENT_DIMMING.store(dimming, Ordering::SeqCst);
-                }
+    /// Store the current dimming value
+    pub(super) fn store_dimming(value: i32) {
+        CURRENT_DIMMING.store(value, Ordering::SeqCst);
+    }
+
+    /// The callback function for the ASUS DLL
+    pub(super) extern "C" fn mode_callback(func: i32, data: i32, str_data: *const i8) {
+        let s = if str_data.is_null() {
+            String::from("null")
+        } else {
+            unsafe {
+                std::ffi::CStr::from_ptr(str_data)
+                    .to_string_lossy()
+                    .to_string()
             }
-            if parts.len() >= 3 {
-                if let Ok(mono) = parts[2].parse::<i32>() {
-                    IS_MONOCHROME.store(mono != 0, Ordering::SeqCst);
-                }
-            }
-            CURRENT_MODE.store(data, Ordering::SeqCst);
+        };
 
-            debug!(
-                "mode updated: data={}, dimming={}, monochrome={}",
-                data,
-                CURRENT_DIMMING.load(Ordering::SeqCst),
-                IS_MONOCHROME.load(Ordering::SeqCst)
-            );
+        trace!("callback: func={}, data={}, str='{}'", func, data, s);
+
+        match func {
+            // Mode info callback
+            18 => {
+                // Parse "0_1_0_1_1,70,0" -> dimming is 2nd field, monochrome is 3rd field
+                let parts: Vec<&str> = s.split(',').collect();
+                if parts.len() >= 2 {
+                    if let Ok(dimming) = parts[1].parse::<i32>() {
+                        CURRENT_DIMMING.store(dimming, Ordering::SeqCst);
+                    }
+                }
+                if parts.len() >= 3 {
+                    if let Ok(mono) = parts[2].parse::<i32>() {
+                        IS_MONOCHROME.store(mono != 0, Ordering::SeqCst);
+                    }
+                }
+                CURRENT_MODE.store(data, Ordering::SeqCst);
+
+                debug!(
+                    "mode updated: data={}, dimming={}, monochrome={}",
+                    data,
+                    CURRENT_DIMMING.load(Ordering::SeqCst),
+                    IS_MONOCHROME.load(Ordering::SeqCst)
+                );
+            }
+            // Manual slider callback
+            20 => {
+                MANUAL_SLIDER.store(data, Ordering::SeqCst);
+                debug!("manual slider updated: {}", data);
+            }
+            // EyeCare slider callback
+            21 => {
+                EYECARE_SLIDER.store(data, Ordering::SeqCst);
+                debug!("eyecare slider updated: {}", data);
+            }
+            // E-reading/Monochrome callback
+            27 => {
+                // Decode: value = (grayscale * 256) + temp - 206
+                let raw = data + 206;
+                let grayscale = raw / 256;
+                let temp = raw % 256;
+                EREADING_GRAYSCALE.store(grayscale, Ordering::SeqCst);
+                EREADING_TEMP.store(temp, Ordering::SeqCst);
+                debug!("e-reading updated: grayscale={}, temp={}", grayscale, temp);
+            }
+            _ => {}
         }
-        // Manual slider callback
-        20 => {
-            MANUAL_SLIDER.store(data, Ordering::SeqCst);
-            debug!("manual slider updated: {}", data);
-        }
-        // EyeCare slider callback
-        21 => {
-            EYECARE_SLIDER.store(data, Ordering::SeqCst);
-            debug!("eyecare slider updated: {}", data);
-        }
-        // E-reading/Monochrome callback
-        27 => {
-            // Decode: value = (grayscale * 256) + temp - 206
-            let raw = data + 206;
-            let grayscale = raw / 256;
-            let temp = raw % 256;
-            EREADING_GRAYSCALE.store(grayscale, Ordering::SeqCst);
-            EREADING_TEMP.store(temp, Ordering::SeqCst);
-            debug!("e-reading updated: grayscale={}, temp={}", grayscale, temp);
-        }
-        _ => {}
     }
 }
 
@@ -224,10 +308,10 @@ impl ManualMode {
         Ok(Self { value })
     }
 
-    /// Create from global state
-    pub fn from_state() -> Self {
+    /// Create from controller state snapshot
+    pub fn from_controller_state(state: &ControllerState) -> Self {
         Self {
-            value: MANUAL_SLIDER.load(Ordering::SeqCst) as u8,
+            value: state.manual_slider,
         }
     }
 }
@@ -264,10 +348,10 @@ impl EyeCareMode {
         Ok(Self { level })
     }
 
-    /// Create from global state
-    pub fn from_state() -> Self {
+    /// Create from controller state snapshot
+    pub fn from_controller_state(state: &ControllerState) -> Self {
         Self {
-            level: EYECARE_SLIDER.load(Ordering::SeqCst) as u8,
+            level: state.eyecare_level,
         }
     }
 }
@@ -308,11 +392,11 @@ impl EReadingMode {
         Ok(Self { grayscale, temp })
     }
 
-    /// Create from global state
-    pub fn from_state() -> Self {
+    /// Create from controller state snapshot
+    pub fn from_controller_state(state: &ControllerState) -> Self {
         Self {
-            grayscale: EREADING_GRAYSCALE.load(Ordering::SeqCst) as u8,
-            temp: EREADING_TEMP.load(Ordering::SeqCst) as u8,
+            grayscale: state.ereading_grayscale,
+            temp: state.ereading_temp,
         }
     }
 }
@@ -339,6 +423,9 @@ impl DisplayMode for EReadingMode {
 // AsusController
 // =============================================================================
 
+/// Guard to ensure only one controller instance exists at a time
+static INSTANCE_EXISTS: AtomicBool = AtomicBool::new(false);
+
 pub struct AsusController {
     lib: Library,
     client: *mut c_void,
@@ -350,7 +437,33 @@ unsafe impl Send for AsusController {}
 unsafe impl Sync for AsusController {}
 
 impl AsusController {
+    /// Create a new controller instance.
+    ///
+    /// Only one instance can exist at a time due to DLL/RPC limitations.
+    /// The instance guard is released when the controller is dropped.
+    ///
+    /// # Errors
+    /// - `AlreadyInitialized` if another instance already exists
+    /// - `PackageNotFound` if the ASUS package is not installed
+    /// - `DllLoad` if the DLL fails to load
+    /// - `RpcInitFailed` if RPC initialization fails
     pub fn new() -> Result<Self, ControllerError> {
+        // Check if an instance already exists
+        if INSTANCE_EXISTS.swap(true, Ordering::SeqCst) {
+            return Err(ControllerError::AlreadyInitialized);
+        }
+
+        // If initialization fails, release the guard
+        match Self::init_internal() {
+            Ok(controller) => Ok(controller),
+            Err(e) => {
+                INSTANCE_EXISTS.store(false, Ordering::SeqCst);
+                Err(e)
+            }
+        }
+    }
+
+    fn init_internal() -> Result<Self, ControllerError> {
         let full_name = find_asus_package()?;
         let path = get_package_path(&full_name)?;
         let dll_path = format!("{}\\ModuleDll\\HWSettings\\{}", path, LOCAL_DLL_NAME);
@@ -374,7 +487,7 @@ impl AsusController {
             type SetCallbackFn = unsafe extern "C" fn(CallbackFn, *mut c_void);
             let set_callback: Symbol<SetCallbackFn> =
                 lib.get(b"SetCallbackForReturnOptimizationResult")?;
-            set_callback(mode_callback, client);
+            set_callback(callback_state::mode_callback, client);
 
             Ok(Self { lib, client })
         }
@@ -411,44 +524,6 @@ impl AsusController {
         }
     }
 
-    /// Refresh slider values from the device
-    pub fn refresh_sliders(&self) -> Result<(), ControllerError> {
-        self.call_rpc_get(b"MyOptGetSplendidManualModeFunc")?;
-        self.call_rpc_get(b"MyOptGetSplendidEyecareModeFunc")?;
-        self.call_rpc_get(b"MyOptGetSplendidMonochromeFunc")?;
-        Ok(())
-    }
-
-    /// Sync all slider values from ASUS hardware
-    /// This fetches: dimming (via mode callback), manual slider, eyecare slider, and e-reading values
-    pub fn sync_all_sliders(&self) -> Result<(), ControllerError> {
-        debug!("syncing all sliders from ASUS...");
-
-        // 1. Get current mode - this also fetches dimming value via func=18 callback
-        let _ = self.get_current_mode();
-
-        // 2. Refresh all other sliders
-        self.refresh_sliders()?;
-
-        // Wait for callbacks
-        std::thread::sleep(std::time::Duration::from_millis(500));
-
-        debug!(
-            "sync complete: dimming={}({}%), manual={}, eyecare={}, e-reading(grayscale={}, temp={})",
-            CURRENT_DIMMING.load(Ordering::SeqCst),
-            Self::dimming_to_percent(CURRENT_DIMMING.load(Ordering::SeqCst)),
-            MANUAL_SLIDER.load(Ordering::SeqCst),
-            EYECARE_SLIDER.load(Ordering::SeqCst),
-            EREADING_GRAYSCALE.load(Ordering::SeqCst),
-            EREADING_TEMP.load(Ordering::SeqCst)
-        );
-        Ok(())
-    }
-
-    // =========================================================================
-    // Dimming
-    // =========================================================================
-
     /// Convert dimming from splendid units (40-100) to percentage (0-100)
     pub fn dimming_to_percent(splendid_value: i32) -> i32 {
         let clamped = splendid_value.clamp(40, 100);
@@ -460,9 +535,73 @@ impl AsusController {
         40 + (percent as f32 / 100.0 * 60.0).round() as i32
     }
 
-    /// Set the display dimming level
-    /// Value range: 40 (dimmest) to 100 (full brightness)
-    pub fn set_dimming(&self, level: i32) -> Result<(), ControllerError> {
+    /// Create a mode from state snapshot
+    fn mode_from_state(
+        &self,
+        state: &ControllerState,
+    ) -> Result<Box<dyn DisplayMode>, ControllerError> {
+        match (state.mode_id, state.is_monochrome) {
+            (1, false) => Ok(Box::new(NormalMode::new())),
+            (2, false) => Ok(Box::new(VividMode::new())),
+            (6, false) => Ok(Box::new(ManualMode::from_controller_state(state))),
+            (7, false) => Ok(Box::new(EyeCareMode::from_controller_state(state))),
+            (_, true) => {
+                callback_state::store_last_non_ereading_mode(state.mode_id);
+                Ok(Box::new(EReadingMode::from_controller_state(state)))
+            }
+            _ => Err(ControllerError::ModeNotDetected),
+        }
+    }
+
+    /// Restore the last non-e-reading mode
+    fn restore_last_mode(&self, state: &ControllerState) -> Box<dyn DisplayMode> {
+        match state.last_non_ereading_mode {
+            2 => Box::new(VividMode::new()),
+            6 => Box::new(ManualMode::from_controller_state(state)),
+            7 => Box::new(EyeCareMode::from_controller_state(state)),
+            _ => Box::new(NormalMode::new()), // Default to Normal
+        }
+    }
+}
+
+impl DisplayController for AsusController {
+    fn get_state(&self) -> ControllerState {
+        callback_state::snapshot()
+    }
+
+    fn refresh_sliders(&self) -> Result<(), ControllerError> {
+        self.call_rpc_get(b"MyOptGetSplendidManualModeFunc")?;
+        self.call_rpc_get(b"MyOptGetSplendidEyecareModeFunc")?;
+        self.call_rpc_get(b"MyOptGetSplendidMonochromeFunc")?;
+        Ok(())
+    }
+
+    fn sync_all_sliders(&self) -> Result<(), ControllerError> {
+        debug!("syncing all sliders from ASUS...");
+
+        // 1. Get current mode - this also fetches dimming value via func=18 callback
+        let _ = self.get_current_mode();
+
+        // 2. Refresh all other sliders
+        self.refresh_sliders()?;
+
+        // Wait for callbacks
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let state = self.get_state();
+        debug!(
+            "sync complete: dimming={}({}%), manual={}, eyecare={}, e-reading(grayscale={}, temp={})",
+            state.dimming,
+            Self::dimming_to_percent(state.dimming),
+            state.manual_slider,
+            state.eyecare_level,
+            state.ereading_grayscale,
+            state.ereading_temp
+        );
+        Ok(())
+    }
+
+    fn set_dimming(&self, level: i32) -> Result<(), ControllerError> {
         let level = level.clamp(40, 100);
         unsafe {
             type SetDimmingFn = unsafe extern "C" fn(i32, *const i8, *mut c_void) -> i64;
@@ -473,7 +612,7 @@ impl AsusController {
             debug!("set dimming to {}, result: {}", level, result);
 
             if result == 0 {
-                CURRENT_DIMMING.store(level, Ordering::SeqCst);
+                callback_state::store_dimming(level);
                 Ok(())
             } else {
                 Err(ControllerError::DimmingFailed(result))
@@ -481,94 +620,39 @@ impl AsusController {
         }
     }
 
-    /// Set dimming using percentage (0-100)
-    pub fn set_dimming_percent(&self, percent: i32) -> Result<(), ControllerError> {
+    fn set_dimming_percent(&self, percent: i32) -> Result<(), ControllerError> {
         let splendid_value = Self::percent_to_dimming(percent.clamp(0, 100));
         self.set_dimming(splendid_value)
     }
 
-    /// Get the current dimming level (from cached state)
-    /// Returns the dimming value (40-100) or -1 if unknown
-    pub fn get_dimming(&self) -> i32 {
-        CURRENT_DIMMING.load(Ordering::SeqCst)
-    }
-
-    /// Get dimming as percentage (0-100)
-    /// Returns -1 if dimming hasn't been synced yet
-    pub fn get_dimming_percent(&self) -> i32 {
-        let dimming = CURRENT_DIMMING.load(Ordering::SeqCst);
-        if dimming < 40 {
-            return -1;
-        }
-        Self::dimming_to_percent(dimming)
-    }
-
-    // =========================================================================
-    // Mode Management
-    // =========================================================================
-
-    /// Get the current display mode
-    pub fn get_current_mode(&self) -> Result<Box<dyn DisplayMode>, ControllerError> {
+    fn get_current_mode(&self) -> Result<Box<dyn DisplayMode>, ControllerError> {
         self.call_rpc_get(b"MyOptGetSplendidColorModeFunc")?;
 
         // Wait for callback to populate values
         std::thread::sleep(std::time::Duration::from_millis(500));
 
-        let mode_id = CURRENT_MODE.load(Ordering::SeqCst);
-        let is_mono = IS_MONOCHROME.load(Ordering::SeqCst);
-
-        self.mode_from_state(mode_id, is_mono)
+        let state = self.get_state();
+        self.mode_from_state(&state)
     }
 
-    /// Create a mode from current global state
-    fn mode_from_state(
-        &self,
-        mode_id: i32,
-        is_monochrome: bool,
-    ) -> Result<Box<dyn DisplayMode>, ControllerError> {
-        match (mode_id, is_monochrome) {
-            (1, false) => Ok(Box::new(NormalMode::new())),
-            (2, false) => Ok(Box::new(VividMode::new())),
-            (6, false) => Ok(Box::new(ManualMode::from_state())),
-            (7, false) => Ok(Box::new(EyeCareMode::from_state())),
-            (_, true) => {
-                LAST_NON_EREADING_MODE.store(mode_id, Ordering::SeqCst);
-                Ok(Box::new(EReadingMode::from_state()))
-            }
-            _ => Err(ControllerError::ModeNotDetected),
-        }
-    }
-
-    /// Restore the last non-e-reading mode
-    fn restore_last_mode(&self) -> Box<dyn DisplayMode> {
-        let last = LAST_NON_EREADING_MODE.load(Ordering::SeqCst);
-        match last {
-            2 => Box::new(VividMode::new()),
-            6 => Box::new(ManualMode::from_state()),
-            7 => Box::new(EyeCareMode::from_state()),
-            _ => Box::new(NormalMode::new()), // Default to Normal
-        }
-    }
-
-    /// Set a display mode
-    pub fn set_mode(&self, mode: &dyn DisplayMode) -> Result<(), ControllerError> {
+    fn set_mode(&self, mode: &dyn DisplayMode) -> Result<(), ControllerError> {
         mode.apply(self)
     }
 
-    /// Toggle e-reading mode on/off
-    pub fn toggle_e_reading(&self) -> Result<Box<dyn DisplayMode>, ControllerError> {
+    fn toggle_e_reading(&self) -> Result<Box<dyn DisplayMode>, ControllerError> {
         let current = self.get_current_mode()?;
         debug!("current mode: {:?}", current);
 
+        let state = self.get_state();
         let target: Box<dyn DisplayMode> = if current.is_ereading() {
             // Exit e-reading - restore previous mode
-            let restored = self.restore_last_mode();
+            let restored = self.restore_last_mode(&state);
             info!("switching from e-reading to {:?}", restored);
             restored
         } else {
             // Enter e-reading
             info!("switching to e-reading");
-            Box::new(EReadingMode::from_state())
+            Box::new(EReadingMode::from_controller_state(&state))
         };
 
         self.set_mode(&*target)?;
@@ -584,6 +668,110 @@ impl Drop for AsusController {
             if let Ok(uninit) = self.lib.get::<UninitFn>(b"MyOptRpcClientUninitialize") {
                 uninit(self.client);
             }
+        }
+        // Release the instance guard
+        INSTANCE_EXISTS.store(false, Ordering::SeqCst);
+    }
+}
+
+// =============================================================================
+// Mock Controller (for testing)
+// =============================================================================
+
+#[cfg(test)]
+pub struct MockController {
+    state: std::sync::Mutex<ControllerState>,
+}
+
+#[cfg(test)]
+impl MockController {
+    pub fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(ControllerState {
+                mode_id: 1,
+                is_monochrome: false,
+                dimming: 70,
+                manual_slider: 50,
+                eyecare_level: 2,
+                ereading_grayscale: 3,
+                ereading_temp: 50,
+                last_non_ereading_mode: 1,
+            }),
+        }
+    }
+
+    pub fn with_state(state: ControllerState) -> Self {
+        Self {
+            state: std::sync::Mutex::new(state),
+        }
+    }
+}
+
+#[cfg(test)]
+impl DisplayController for MockController {
+    fn get_state(&self) -> ControllerState {
+        self.state.lock().unwrap().clone()
+    }
+
+    fn refresh_sliders(&self) -> Result<(), ControllerError> {
+        Ok(())
+    }
+
+    fn sync_all_sliders(&self) -> Result<(), ControllerError> {
+        Ok(())
+    }
+
+    fn set_dimming(&self, level: i32) -> Result<(), ControllerError> {
+        self.state.lock().unwrap().dimming = level.clamp(40, 100);
+        Ok(())
+    }
+
+    fn set_dimming_percent(&self, percent: i32) -> Result<(), ControllerError> {
+        let splendid_value = AsusController::percent_to_dimming(percent.clamp(0, 100));
+        self.set_dimming(splendid_value)
+    }
+
+    fn get_current_mode(&self) -> Result<Box<dyn DisplayMode>, ControllerError> {
+        let state = self.get_state();
+        match (state.mode_id, state.is_monochrome) {
+            (1, false) => Ok(Box::new(NormalMode::new())),
+            (2, false) => Ok(Box::new(VividMode::new())),
+            (6, false) => Ok(Box::new(ManualMode::from_controller_state(&state))),
+            (7, false) => Ok(Box::new(EyeCareMode::from_controller_state(&state))),
+            (_, true) => Ok(Box::new(EReadingMode::from_controller_state(&state))),
+            _ => Err(ControllerError::ModeNotDetected),
+        }
+    }
+
+    fn set_mode(&self, mode: &dyn DisplayMode) -> Result<(), ControllerError> {
+        let mut state = self.state.lock().unwrap();
+        if mode.is_ereading() {
+            state.last_non_ereading_mode = state.mode_id;
+            state.is_monochrome = true;
+        } else {
+            state.mode_id = mode.mode_id();
+            state.is_monochrome = false;
+        }
+        Ok(())
+    }
+
+    fn toggle_e_reading(&self) -> Result<Box<dyn DisplayMode>, ControllerError> {
+        let state = self.get_state();
+        if state.is_monochrome {
+            // Exit e-reading
+            let restored: Box<dyn DisplayMode> = match state.last_non_ereading_mode {
+                2 => Box::new(VividMode::new()),
+                6 => Box::new(ManualMode::from_controller_state(&state)),
+                7 => Box::new(EyeCareMode::from_controller_state(&state)),
+                _ => Box::new(NormalMode::new()),
+            };
+            self.set_mode(&*restored)?;
+            Ok(restored)
+        } else {
+            // Enter e-reading
+            let ereading = Box::new(EReadingMode::from_controller_state(&state));
+            self.set_mode(&*ereading)?;
+            Ok(ereading)
         }
     }
 }
@@ -682,16 +870,90 @@ fn get_package_path(full_name: &str) -> Result<String, ControllerError> {
 // =============================================================================
 
 fn main() -> Result<(), ControllerError> {
-    let controller = AsusController::new()?;
+    let ctrl = AsusController::new()?;
 
     // Refresh slider values from device
-    controller.refresh_sliders()?;
+    ctrl.refresh_sliders()?;
 
     // Toggle e-reading mode
-    match controller.toggle_e_reading() {
+    match ctrl.toggle_e_reading() {
         Ok(new_mode) => println!("Toggled to: {:?}", new_mode),
         Err(e) => println!("Error: {}", e),
     }
 
     Ok(())
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mock_controller_toggle_ereading() {
+        let mock = MockController::new();
+
+        // Initially in Normal mode
+        let mode = mock.get_current_mode().unwrap();
+        assert!(!mode.is_ereading());
+        assert_eq!(mode.mode_id(), 1);
+
+        // Toggle to e-reading
+        let mode = mock.toggle_e_reading().unwrap();
+        assert!(mode.is_ereading());
+
+        // Toggle back to Normal
+        let mode = mock.toggle_e_reading().unwrap();
+        assert!(!mode.is_ereading());
+        assert_eq!(mode.mode_id(), 1);
+    }
+
+    #[test]
+    fn test_mock_controller_dimming() {
+        let mock = MockController::new();
+
+        mock.set_dimming(80).unwrap();
+        assert_eq!(mock.get_state().dimming, 80);
+
+        mock.set_dimming_percent(50).unwrap();
+        let expected = AsusController::percent_to_dimming(50);
+        assert_eq!(mock.get_state().dimming, expected);
+    }
+
+    #[test]
+    fn test_dimming_conversion() {
+        // 0% -> 40, 100% -> 100
+        assert_eq!(AsusController::percent_to_dimming(0), 40);
+        assert_eq!(AsusController::percent_to_dimming(100), 100);
+        assert_eq!(AsusController::percent_to_dimming(50), 70);
+
+        // Reverse
+        assert_eq!(AsusController::dimming_to_percent(40), 0);
+        assert_eq!(AsusController::dimming_to_percent(100), 100);
+        assert_eq!(AsusController::dimming_to_percent(70), 50);
+    }
+
+    #[test]
+    fn test_mode_from_controller_state() {
+        let state = ControllerState {
+            manual_slider: 75,
+            eyecare_level: 3,
+            ereading_grayscale: 2,
+            ereading_temp: 60,
+            ..Default::default()
+        };
+
+        let manual = ManualMode::from_controller_state(&state);
+        assert_eq!(manual.value, 75);
+
+        let eyecare = EyeCareMode::from_controller_state(&state);
+        assert_eq!(eyecare.level, 3);
+
+        let ereading = EReadingMode::from_controller_state(&state);
+        assert_eq!(ereading.grayscale, 2);
+        assert_eq!(ereading.temp, 60);
+    }
 }
