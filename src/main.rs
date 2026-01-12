@@ -6,69 +6,57 @@ use windows_sys::Win32::{
 };
 
 use libloading::{Library, Symbol};
+use std::ffi::c_void;
 use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 const LOCAL_DLL_NAME: &str = "AsusCustomizationRpcClient.dll";
 
-// Global state for callback
+// =============================================================================
+// Error Types
+// =============================================================================
+
+#[derive(Debug, thiserror::Error)]
+pub enum ControllerError {
+    #[error("Package not found (error code: {0})")]
+    PackageNotFound(u32),
+
+    #[error("Failed to get package path (error code: {0})")]
+    PackagePathError(u32),
+
+    #[error("Failed to load DLL: {0}")]
+    DllLoad(#[from] libloading::Error),
+
+    #[error("RPC initialization failed")]
+    RpcInitFailed,
+
+    #[error("Invalid slider value {value} for {mode} (expected {min}-{max})")]
+    InvalidSliderValue {
+        mode: &'static str,
+        value: u8,
+        min: u8,
+        max: u8,
+    },
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("Failed to get current mode")]
+    ModeNotDetected,
+}
+
+// =============================================================================
+// Global Callback State
+// =============================================================================
+
 static CURRENT_MODE: AtomicI32 = AtomicI32::new(-1);
 static IS_MONOCHROME: AtomicBool = AtomicBool::new(false);
-// this won't have `EReading`
 static LAST_NON_EREADING_MODE: AtomicI32 = AtomicI32::new(1); // Default to Normal
 
 static MANUAL_SLIDER: AtomicI32 = AtomicI32::new(50); // Default middle
 static EYECARE_SLIDER: AtomicI32 = AtomicI32::new(2); // Default level
 static EREADING_GRAYSCALE: AtomicI32 = AtomicI32::new(3); // Default grayscale 3
-static EREADING_TEMP: AtomicI32 = AtomicI32::new(562); // Default temp 3
-
-/// Splendid display modes with associated slider values
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum SplendidMode {
-    Normal,
-    Vivid,
-    /// Manual color temperature: 0-100
-    Manual(u8),
-    /// EyeCare blue light filter level: 0-4
-    EyeCare(u8),
-    /// E-Reading mode with grayscale and temperature adjustments
-    EReading {
-        /// Grayscale level: 0-4 (maps to 1-5 internally)
-        grayscale: u8,
-        /// Temperature: 0-100 (maps to -50 to +50 internally)
-        temp: u8,
-    },
-}
-
-impl SplendidMode {
-    /// Create from mode ID, loading slider values from global state
-    fn from_mode_id(mode_id: i32) -> Self {
-        match mode_id {
-            1 => Self::Normal,
-            2 => Self::Vivid,
-            6 => Self::Manual(MANUAL_SLIDER.load(Ordering::SeqCst) as u8),
-            7 => Self::EyeCare(EYECARE_SLIDER.load(Ordering::SeqCst) as u8),
-            _ => unreachable!(),
-        }
-    }
-
-    fn from_callback(data: i32, is_monochrome: bool) -> Option<Self> {
-        match (data, is_monochrome) {
-            (1, false) => Some(Self::Normal),
-            (2, false) => Some(Self::Vivid),
-            (6, false) => Some(Self::Manual(MANUAL_SLIDER.load(Ordering::SeqCst) as u8)),
-            (7, false) => Some(Self::EyeCare(EYECARE_SLIDER.load(Ordering::SeqCst) as u8)),
-            (n, true) => {
-                LAST_NON_EREADING_MODE.store(n, Ordering::SeqCst);
-                Some(Self::EReading {
-                    grayscale: EREADING_GRAYSCALE.load(Ordering::SeqCst) as u8,
-                    temp: EREADING_TEMP.load(Ordering::SeqCst) as u8,
-                })
-            }
-            _ => None,
-        }
-    }
-}
+static EREADING_TEMP: AtomicI32 = AtomicI32::new(562); // Default temp
 
 extern "C" fn mode_callback(func: i32, data: i32, str_data: *const i8) {
     let s = if str_data.is_null() {
@@ -81,7 +69,6 @@ extern "C" fn mode_callback(func: i32, data: i32, str_data: *const i8) {
         }
     };
 
-    // Log ALL callbacks for debugging
     println!("func={}, data={}, str='{}'", func, data, s);
 
     match func {
@@ -115,7 +102,6 @@ extern "C" fn mode_callback(func: i32, data: i32, str_data: *const i8) {
         // E-reading/Monochrome callback
         27 => {
             // Decode: value = (grayscale * 256) + temp - 206
-            // So: raw = value + 206, grayscale = raw / 256, temp = raw % 256
             let raw = data + 206;
             let grayscale = raw / 256;
             let temp = raw % 256;
@@ -127,36 +113,235 @@ extern "C" fn mode_callback(func: i32, data: i32, str_data: *const i8) {
     }
 }
 
+// =============================================================================
+// Display Mode Trait
+// =============================================================================
+
+pub trait DisplayMode: std::fmt::Debug + Send + Sync {
+    /// Apply this mode using the controller
+    fn apply(&self, controller: &AsusController) -> Result<(), ControllerError>;
+
+    /// Get the RPC symbol name for setting this mode
+    fn symbol(&self) -> &'static [u8];
+
+    /// Whether this is an e-reading/monochrome mode
+    fn is_ereading(&self) -> bool {
+        false
+    }
+
+    /// Get the mode ID for this mode (used for state tracking)
+    fn mode_id(&self) -> i32;
+}
+
+// =============================================================================
+// Mode Implementations
+// =============================================================================
+
+#[derive(Debug, Clone, Copy)]
+pub struct NormalMode;
+
+impl NormalMode {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for NormalMode {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DisplayMode for NormalMode {
+    fn apply(&self, controller: &AsusController) -> Result<(), ControllerError> {
+        controller.set_splendid_mode(b"MyOptSetSplendidFunc", 1)
+    }
+
+    fn symbol(&self) -> &'static [u8] {
+        b"MyOptSetSplendidFunc"
+    }
+
+    fn mode_id(&self) -> i32 {
+        1
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct VividMode;
+
+impl VividMode {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for VividMode {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DisplayMode for VividMode {
+    fn apply(&self, controller: &AsusController) -> Result<(), ControllerError> {
+        controller.set_splendid_mode(b"MyOptSetSplendidFunc", 2)
+    }
+
+    fn symbol(&self) -> &'static [u8] {
+        b"MyOptSetSplendidFunc"
+    }
+
+    fn mode_id(&self) -> i32 {
+        2
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ManualMode {
+    pub value: u8,
+}
+
+impl ManualMode {
+    pub fn new(value: u8) -> Result<Self, ControllerError> {
+        if value > 100 {
+            return Err(ControllerError::InvalidSliderValue {
+                mode: "Manual",
+                value,
+                min: 0,
+                max: 100,
+            });
+        }
+        Ok(Self { value })
+    }
+
+    /// Create from global state
+    pub fn from_state() -> Self {
+        Self {
+            value: MANUAL_SLIDER.load(Ordering::SeqCst) as u8,
+        }
+    }
+}
+
+impl DisplayMode for ManualMode {
+    fn apply(&self, controller: &AsusController) -> Result<(), ControllerError> {
+        controller.set_splendid_mode(b"MyOptSetSplendidManualFunc", self.value)
+    }
+
+    fn symbol(&self) -> &'static [u8] {
+        b"MyOptSetSplendidManualFunc"
+    }
+
+    fn mode_id(&self) -> i32 {
+        6
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct EyeCareMode {
+    pub level: u8,
+}
+
+impl EyeCareMode {
+    pub fn new(level: u8) -> Result<Self, ControllerError> {
+        if level > 4 {
+            return Err(ControllerError::InvalidSliderValue {
+                mode: "EyeCare",
+                value: level,
+                min: 0,
+                max: 4,
+            });
+        }
+        Ok(Self { level })
+    }
+
+    /// Create from global state
+    pub fn from_state() -> Self {
+        Self {
+            level: EYECARE_SLIDER.load(Ordering::SeqCst) as u8,
+        }
+    }
+}
+
+impl DisplayMode for EyeCareMode {
+    fn apply(&self, controller: &AsusController) -> Result<(), ControllerError> {
+        controller.set_splendid_mode(b"MyOptSetSplendidEyecareFunc", self.level)
+    }
+
+    fn symbol(&self) -> &'static [u8] {
+        b"MyOptSetSplendidEyecareFunc"
+    }
+
+    fn mode_id(&self) -> i32 {
+        7
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct EReadingMode {
+    /// Grayscale level: 0-4 (maps to 1-5 internally)
+    pub grayscale: u8,
+    /// Temperature: 0-100 (maps to -50 to +50 internally)
+    pub temp: u8,
+}
+
+impl EReadingMode {
+    pub fn new(grayscale: u8, temp: u8) -> Result<Self, ControllerError> {
+        if grayscale > 4 {
+            return Err(ControllerError::InvalidSliderValue {
+                mode: "EReading grayscale",
+                value: grayscale,
+                min: 0,
+                max: 4,
+            });
+        }
+        // temp is stored as raw value from callback, allow full range
+        Ok(Self { grayscale, temp })
+    }
+
+    /// Create from global state
+    pub fn from_state() -> Self {
+        Self {
+            grayscale: EREADING_GRAYSCALE.load(Ordering::SeqCst) as u8,
+            temp: EREADING_TEMP.load(Ordering::SeqCst) as u8,
+        }
+    }
+}
+
+impl DisplayMode for EReadingMode {
+    fn apply(&self, controller: &AsusController) -> Result<(), ControllerError> {
+        controller.set_monochrome_mode(self.grayscale, self.temp)
+    }
+
+    fn symbol(&self) -> &'static [u8] {
+        b"MyOptSetSplendidMonochromeFunc"
+    }
+
+    fn is_ereading(&self) -> bool {
+        true
+    }
+
+    fn mode_id(&self) -> i32 {
+        -1 // Special case - e-reading doesn't have a single mode ID
+    }
+}
+
+// =============================================================================
+// AsusController
+// =============================================================================
+
 pub struct AsusController {
     lib: Library,
-    client: *mut std::ffi::c_void,
+    client: *mut c_void,
 }
 
-#[derive(Debug)]
-pub struct SliderError(libloading::Error);
-
-impl From<libloading::Error> for SliderError {
-    fn from(value: libloading::Error) -> Self {
-        Self(value)
-    }
-}
-
-impl std::fmt::Display for SliderError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "failed to store slider value in global {}", self.0,)
-    }
-}
-
-impl std::error::Error for SliderError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.0)
-    }
-}
+// Safety: The client pointer is only used with the DLL functions
+// and the Library keeps the DLL loaded for the lifetime of AsusController
+unsafe impl Send for AsusController {}
+unsafe impl Sync for AsusController {}
 
 impl AsusController {
-    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let full_name = find_asus_package().map_err(|e| format!("Package error: {}", e))?;
-        let path = get_package_path(&full_name).map_err(|e| format!("Path error: {}", e))?;
+    pub fn new() -> Result<Self, ControllerError> {
+        let full_name = find_asus_package()?;
+        let path = get_package_path(&full_name)?;
         let dll_path = format!("{}\\ModuleDll\\HWSettings\\{}", path, LOCAL_DLL_NAME);
 
         fs::copy(&dll_path, LOCAL_DLL_NAME)?;
@@ -164,18 +349,18 @@ impl AsusController {
         unsafe {
             let lib = Library::new(LOCAL_DLL_NAME)?;
 
-            type InitFn = unsafe extern "C" fn(*mut *mut std::ffi::c_void) -> i64;
+            type InitFn = unsafe extern "C" fn(*mut *mut c_void) -> i64;
             let init: Symbol<InitFn> = lib.get(b"MyOptRpcClientInitialize")?;
 
-            let mut client: *mut std::ffi::c_void = std::ptr::null_mut();
+            let mut client: *mut c_void = std::ptr::null_mut();
             let result = init(&mut client);
             if result != 0 || client.is_null() {
-                return Err("Failed to initialize RPC".into());
+                return Err(ControllerError::RpcInitFailed);
             }
 
             // Register callback
             type CallbackFn = unsafe extern "C" fn(i32, i32, *const i8);
-            type SetCallbackFn = unsafe extern "C" fn(CallbackFn, *mut std::ffi::c_void);
+            type SetCallbackFn = unsafe extern "C" fn(CallbackFn, *mut c_void);
             let set_callback: Symbol<SetCallbackFn> =
                 lib.get(b"SetCallbackForReturnOptimizationResult")?;
             set_callback(mode_callback, client);
@@ -184,141 +369,131 @@ impl AsusController {
         }
     }
 
-    pub fn get_current_mode(&self) -> Option<SplendidMode> {
+    /// Call an RPC function that takes only the client pointer and returns i64
+    fn call_rpc_get(&self, symbol: &[u8]) -> Result<i64, ControllerError> {
         unsafe {
-            type GetColorModeFn = unsafe extern "C" fn(*mut std::ffi::c_void) -> i64;
-            let get_color_mode: Symbol<GetColorModeFn> =
-                self.lib.get(b"MyOptGetSplendidColorModeFunc").ok()?;
-
-            get_color_mode(self.client);
-
-            // Wait for callback
-            std::thread::sleep(std::time::Duration::from_millis(500));
-
-            // callback populated the global values by now
-            let mode = CURRENT_MODE.load(Ordering::SeqCst);
-            let mono = IS_MONOCHROME.load(Ordering::SeqCst);
-            // just prints the values, the fn name could be misleading, it just
-            // detects the mode from the values that we had from callback
-            SplendidMode::from_callback(mode, mono)
+            type GetFn = unsafe extern "C" fn(*mut c_void) -> i64;
+            let func: Symbol<GetFn> = self.lib.get(symbol)?;
+            Ok(func(self.client))
         }
     }
 
-    fn store_slider_value_in_global(&self, symbol: &[u8]) -> Result<i64, SliderError> {
+    /// Set a splendid mode with a value parameter
+    fn set_splendid_mode(&self, symbol: &[u8], value: u8) -> Result<(), ControllerError> {
         unsafe {
-            type GetSliderFn = unsafe extern "C" fn(*mut std::ffi::c_void) -> i64;
-            let get_slider_fn: Symbol<GetSliderFn> = self.lib.get(symbol)?;
-
-            Ok(get_slider_fn(self.client))
-        }
-    }
-
-    pub fn get_manual_sliding(&self) -> Result<i64, SliderError> {
-        self.store_slider_value_in_global(b"MyOptGetSplendidManualModeFunc")
-    }
-
-    pub fn get_eyecare_sliding(&self) -> Result<i64, SliderError> {
-        self.store_slider_value_in_global(b"MyOptGetSplendidEyecareModeFunc")
-    }
-
-    pub fn get_ereading_value(&self) -> Result<(i32, i32), SliderError> {
-        let _get_mono = self.store_slider_value_in_global(b"MyOptGetSplendidMonochromeFunc")?;
-
-        let grayscale = EREADING_GRAYSCALE.load(Ordering::SeqCst);
-        let temp = EREADING_TEMP.load(Ordering::SeqCst);
-        Ok((grayscale, temp))
-    }
-
-    fn set_mode_helper(&self, value: u8, mode: SplendidMode) -> Result<(), SliderError> {
-        let symbol: &[u8] = match mode {
-            SplendidMode::Normal | SplendidMode::Vivid => b"MyOptSetSplendidFunc",
-            SplendidMode::Manual(_) => b"MyOptSetSplendidManualFunc",
-            SplendidMode::EyeCare(_) => b"MyOptSetSplendidEyecareFunc",
-            SplendidMode::EReading { .. } => unreachable!(),
-        };
-
-        type SetModeFn = unsafe extern "C" fn(u8, *const i8, *mut std::ffi::c_void) -> i64;
-        let set_fn: Symbol<SetModeFn> = unsafe { self.lib.get(symbol) }?;
-        let empty_str = b"\0".as_ptr() as *const i8;
-        unsafe { set_fn(value, empty_str, self.client) };
-        Ok(())
-    }
-
-    // Update set_mode to restore slider values
-    pub fn set_mode(&self, mode: SplendidMode) -> Result<(), Box<dyn std::error::Error>> {
-        unsafe {
-            match mode {
-                SplendidMode::Normal => self.set_mode_helper(1, mode)?,
-                SplendidMode::Vivid => self.set_mode_helper(2, mode)?,
-                SplendidMode::Manual(slider) => {
-                    self.set_mode_helper(slider, mode)?;
-                }
-                SplendidMode::EyeCare(level) => {
-                    self.set_mode_helper(level, mode)?;
-                }
-                SplendidMode::EReading { grayscale, temp } => {
-                    type SetMonoFn = unsafe extern "C" fn(i32, *mut std::ffi::c_void) -> i64;
-                    let set_mono: Symbol<SetMonoFn> =
-                        self.lib.get(b"MyOptSetSplendidMonochromeFunc")?;
-                    let value = (grayscale as i32 * 256) + temp as i32 - 206;
-                    set_mono(value, self.client);
-                }
-            }
+            type SetModeFn = unsafe extern "C" fn(u8, *const i8, *mut c_void) -> i64;
+            let set_fn: Symbol<SetModeFn> = self.lib.get(symbol)?;
+            let empty_str = b"\0".as_ptr() as *const i8;
+            set_fn(value, empty_str, self.client);
             Ok(())
         }
     }
 
-    pub fn toggle_e_reading(&self) -> Result<SplendidMode, Box<dyn std::error::Error>> {
-        let current = self.get_current_mode();
+    /// Set monochrome/e-reading mode with grayscale and temp
+    fn set_monochrome_mode(&self, grayscale: u8, temp: u8) -> Result<(), ControllerError> {
+        unsafe {
+            type SetMonoFn = unsafe extern "C" fn(i32, *mut c_void) -> i64;
+            let set_mono: Symbol<SetMonoFn> = self.lib.get(b"MyOptSetSplendidMonochromeFunc")?;
+            let value = (grayscale as i32 * 256) + temp as i32 - 206;
+            set_mono(value, self.client);
+            Ok(())
+        }
+    }
+
+    /// Refresh slider values from the device
+    pub fn refresh_sliders(&self) -> Result<(), ControllerError> {
+        self.call_rpc_get(b"MyOptGetSplendidManualModeFunc")?;
+        self.call_rpc_get(b"MyOptGetSplendidEyecareModeFunc")?;
+        self.call_rpc_get(b"MyOptGetSplendidMonochromeFunc")?;
+        Ok(())
+    }
+
+    /// Get the current display mode
+    pub fn get_current_mode(&self) -> Result<Box<dyn DisplayMode>, ControllerError> {
+        self.call_rpc_get(b"MyOptGetSplendidColorModeFunc")?;
+
+        // Wait for callback to populate values
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let mode_id = CURRENT_MODE.load(Ordering::SeqCst);
+        let is_mono = IS_MONOCHROME.load(Ordering::SeqCst);
+
+        self.mode_from_state(mode_id, is_mono)
+    }
+
+    /// Create a mode from current global state
+    fn mode_from_state(
+        &self,
+        mode_id: i32,
+        is_monochrome: bool,
+    ) -> Result<Box<dyn DisplayMode>, ControllerError> {
+        match (mode_id, is_monochrome) {
+            (1, false) => Ok(Box::new(NormalMode::new())),
+            (2, false) => Ok(Box::new(VividMode::new())),
+            (6, false) => Ok(Box::new(ManualMode::from_state())),
+            (7, false) => Ok(Box::new(EyeCareMode::from_state())),
+            (_, true) => {
+                LAST_NON_EREADING_MODE.store(mode_id, Ordering::SeqCst);
+                Ok(Box::new(EReadingMode::from_state()))
+            }
+            _ => Err(ControllerError::ModeNotDetected),
+        }
+    }
+
+    /// Restore the last non-e-reading mode
+    fn restore_last_mode(&self) -> Box<dyn DisplayMode> {
+        let last = LAST_NON_EREADING_MODE.load(Ordering::SeqCst);
+        match last {
+            2 => Box::new(VividMode::new()),
+            6 => Box::new(ManualMode::from_state()),
+            7 => Box::new(EyeCareMode::from_state()),
+            _ => Box::new(NormalMode::new()), // Default to Normal
+        }
+    }
+
+    /// Set a display mode
+    pub fn set_mode(&self, mode: &dyn DisplayMode) -> Result<(), ControllerError> {
+        mode.apply(self)
+    }
+
+    /// Toggle e-reading mode on/off
+    pub fn toggle_e_reading(&self) -> Result<Box<dyn DisplayMode>, ControllerError> {
+        let current = self.get_current_mode()?;
         println!("Current mode: {:?}", current);
 
-        match current {
-            Some(SplendidMode::EReading { .. }) => {
-                // Switch back to last mode or Normal
-                let last = LAST_NON_EREADING_MODE.load(Ordering::SeqCst);
-                let target = SplendidMode::from_mode_id(last);
-                println!("Switching from E-Reading to {:?}", target);
-                self.set_mode(target)?;
-                Ok(target)
-            }
-            Some(mode) => {
-                println!("Switching from {:?} to E-Reading", mode);
-                let ereading = SplendidMode::EReading {
-                    grayscale: EREADING_GRAYSCALE.load(Ordering::SeqCst) as u8,
-                    temp: EREADING_TEMP.load(Ordering::SeqCst) as u8,
-                };
-                self.set_mode(ereading)?;
-                Ok(ereading)
-            }
-            None => {
-                println!("Unknown mode, switching to E-Reading");
-                let ereading = SplendidMode::EReading {
-                    grayscale: EREADING_GRAYSCALE.load(Ordering::SeqCst) as u8,
-                    temp: EREADING_TEMP.load(Ordering::SeqCst) as u8,
-                };
-                self.set_mode(ereading)?;
-                Ok(ereading)
+        let target: Box<dyn DisplayMode> = if current.is_ereading() {
+            // Exit e-reading - restore previous mode
+            let restored = self.restore_last_mode();
+            println!("Switching from E-Reading to {:?}", restored);
+            restored
+        } else {
+            // Enter e-reading
+            println!("Switching to E-Reading");
+            Box::new(EReadingMode::from_state())
+        };
+
+        self.set_mode(&*target)?;
+        Ok(target)
+    }
+}
+
+impl Drop for AsusController {
+    fn drop(&mut self) {
+        unsafe {
+            // Try to uninitialize the RPC client
+            type UninitFn = unsafe extern "C" fn(*mut c_void);
+            if let Ok(uninit) = self.lib.get::<UninitFn>(b"MyOptRpcClientUninitialize") {
+                uninit(self.client);
             }
         }
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let controller = AsusController::new().expect("Failed to create controller");
+// =============================================================================
+// Windows Package Helpers
+// =============================================================================
 
-    controller.get_manual_sliding()?;
-    controller.get_eyecare_sliding()?;
-    controller.get_ereading_value()?;
-
-    // Toggle e-reading mode
-    match controller.toggle_e_reading() {
-        Ok(new_mode) => println!("Toggled to: {:?}", new_mode),
-        Err(e) => println!("Error: {}", e),
-    }
-    Ok(())
-}
-
-fn find_asus_package() -> Result<String, u32> {
+fn find_asus_package() -> Result<String, ControllerError> {
     let family_name: Vec<u16> = "B9ECED6F.ASUSPCAssistant_qmba6cd70vzyy\0"
         .encode_utf16()
         .collect();
@@ -339,7 +514,7 @@ fn find_asus_package() -> Result<String, u32> {
     };
 
     if result != ERROR_INSUFFICIENT_BUFFER {
-        return Err(result);
+        return Err(ControllerError::PackageNotFound(result));
     }
 
     let mut package_names: Vec<*mut u16> = vec![std::ptr::null_mut(); count as usize];
@@ -358,7 +533,7 @@ fn find_asus_package() -> Result<String, u32> {
     };
 
     if result != 0 {
-        return Err(result);
+        return Err(ControllerError::PackageNotFound(result));
     }
 
     let full_name = unsafe {
@@ -370,7 +545,7 @@ fn find_asus_package() -> Result<String, u32> {
     Ok(full_name)
 }
 
-fn get_package_path(full_name: &str) -> Result<String, u32> {
+fn get_package_path(full_name: &str) -> Result<String, ControllerError> {
     let full_name_wide: Vec<u16> = format!("{}\0", full_name).encode_utf16().collect();
     let mut buffer_length = 0u32;
 
@@ -383,7 +558,7 @@ fn get_package_path(full_name: &str) -> Result<String, u32> {
     };
 
     if result != ERROR_INSUFFICIENT_BUFFER {
-        return Err(result);
+        return Err(ControllerError::PackagePathError(result));
     }
 
     let mut buffer: Vec<u16> = vec![0; buffer_length as usize];
@@ -396,9 +571,28 @@ fn get_package_path(full_name: &str) -> Result<String, u32> {
     };
 
     if result != 0 {
-        return Err(result);
+        return Err(ControllerError::PackagePathError(result));
     }
 
     let len = buffer.iter().take_while(|&&c| c != 0).count();
     Ok(String::from_utf16_lossy(&buffer[..len]))
+}
+
+// =============================================================================
+// Main
+// =============================================================================
+
+fn main() -> Result<(), ControllerError> {
+    let controller = AsusController::new()?;
+
+    // Refresh slider values from device
+    controller.refresh_sliders()?;
+
+    // Toggle e-reading mode
+    match controller.toggle_e_reading() {
+        Ok(new_mode) => println!("Toggled to: {:?}", new_mode),
+        Err(e) => println!("Error: {}", e),
+    }
+
+    Ok(())
 }
