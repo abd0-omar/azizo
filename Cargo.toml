@@ -1,13 +1,30 @@
 [package]
-name = "asus_windows_api"
+name = "asus-display-control"
 version = "0.1.0"
 edition = "2024"
+description = "Unofficial Rust API for ASUS Splendid display control"
+license = "MIT OR Apache-2.0"
+keywords = ["asus", "display", "windows", "hardware", "splendid"]
+categories = ["hardware-support", "os::windows-apis"]
+readme = "README.md"
+exclude = ["target/", "*.dll"]
+
+[lib]
+name = "asus_display_control"
+path = "src/lib.rs"
+
+[[example]]
+name = "toggle_ereading"
+path = "examples/toggle_ereading.rs"
 
 [dependencies]
 libloading = "0.9.0"
 log = "0.4.29"
 thiserror = "2.0"
 windows-sys = { version = "0.61.2", features = [
-  "Win32",
-  "Win32_Storage_Packaging_Appx",
+    "Win32",
+    "Win32_Storage_Packaging_Appx",
 ] }
+
+[dev-dependencies]
+env_logger = "0.11"
