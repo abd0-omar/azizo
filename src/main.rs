@@ -6,6 +6,7 @@ use windows_sys::Win32::{
 };
 
 use libloading::{Library, Symbol};
+use log::{debug, info, trace};
 use std::ffi::c_void;
 use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -73,7 +74,7 @@ extern "C" fn mode_callback(func: i32, data: i32, str_data: *const i8) {
         }
     };
 
-    println!("func={}, data={}, str='{}'", func, data, s);
+    trace!("callback: func={}, data={}, str='{}'", func, data, s);
 
     match func {
         // Mode info callback
@@ -92,8 +93,8 @@ extern "C" fn mode_callback(func: i32, data: i32, str_data: *const i8) {
             }
             CURRENT_MODE.store(data, Ordering::SeqCst);
 
-            println!(
-                "Mode updated: data={}, dimming={}, monochrome={}",
+            debug!(
+                "mode updated: data={}, dimming={}, monochrome={}",
                 data,
                 CURRENT_DIMMING.load(Ordering::SeqCst),
                 IS_MONOCHROME.load(Ordering::SeqCst)
@@ -102,12 +103,12 @@ extern "C" fn mode_callback(func: i32, data: i32, str_data: *const i8) {
         // Manual slider callback
         20 => {
             MANUAL_SLIDER.store(data, Ordering::SeqCst);
-            println!("Manual slider updated: {}", data);
+            debug!("manual slider updated: {}", data);
         }
         // EyeCare slider callback
         21 => {
             EYECARE_SLIDER.store(data, Ordering::SeqCst);
-            println!("EyeCare slider updated: {}", data);
+            debug!("eyecare slider updated: {}", data);
         }
         // E-reading/Monochrome callback
         27 => {
@@ -117,7 +118,7 @@ extern "C" fn mode_callback(func: i32, data: i32, str_data: *const i8) {
             let temp = raw % 256;
             EREADING_GRAYSCALE.store(grayscale, Ordering::SeqCst);
             EREADING_TEMP.store(temp, Ordering::SeqCst);
-            println!("E-reading updated: grayscale={}, temp={}", grayscale, temp);
+            debug!("e-reading updated: grayscale={}, temp={}", grayscale, temp);
         }
         _ => {}
     }
@@ -421,7 +422,7 @@ impl AsusController {
     /// Sync all slider values from ASUS hardware
     /// This fetches: dimming (via mode callback), manual slider, eyecare slider, and e-reading values
     pub fn sync_all_sliders(&self) -> Result<(), ControllerError> {
-        println!("Syncing all sliders from ASUS...");
+        debug!("syncing all sliders from ASUS...");
 
         // 1. Get current mode - this also fetches dimming value via func=18 callback
         let _ = self.get_current_mode();
@@ -432,19 +433,12 @@ impl AsusController {
         // Wait for callbacks
         std::thread::sleep(std::time::Duration::from_millis(500));
 
-        println!("Sync complete:");
-        println!(
-            "  Dimming: {} (splendid) / {}%",
+        debug!(
+            "sync complete: dimming={}({}%), manual={}, eyecare={}, e-reading(grayscale={}, temp={})",
             CURRENT_DIMMING.load(Ordering::SeqCst),
-            Self::dimming_to_percent(CURRENT_DIMMING.load(Ordering::SeqCst))
-        );
-        println!("  Manual slider: {}", MANUAL_SLIDER.load(Ordering::SeqCst));
-        println!(
-            "  EyeCare slider: {}",
-            EYECARE_SLIDER.load(Ordering::SeqCst)
-        );
-        println!(
-            "  E-reading: grayscale={}, temp={}",
+            Self::dimming_to_percent(CURRENT_DIMMING.load(Ordering::SeqCst)),
+            MANUAL_SLIDER.load(Ordering::SeqCst),
+            EYECARE_SLIDER.load(Ordering::SeqCst),
             EREADING_GRAYSCALE.load(Ordering::SeqCst),
             EREADING_TEMP.load(Ordering::SeqCst)
         );
@@ -476,7 +470,7 @@ impl AsusController {
 
             let empty_str = b"\0".as_ptr() as *const i8;
             let result = set_dimming(level, empty_str, self.client);
-            println!("Set dimming to {}, result: {}", level, result);
+            debug!("set dimming to {}, result: {}", level, result);
 
             if result == 0 {
                 CURRENT_DIMMING.store(level, Ordering::SeqCst);
@@ -564,16 +558,16 @@ impl AsusController {
     /// Toggle e-reading mode on/off
     pub fn toggle_e_reading(&self) -> Result<Box<dyn DisplayMode>, ControllerError> {
         let current = self.get_current_mode()?;
-        println!("Current mode: {:?}", current);
+        debug!("current mode: {:?}", current);
 
         let target: Box<dyn DisplayMode> = if current.is_ereading() {
             // Exit e-reading - restore previous mode
             let restored = self.restore_last_mode();
-            println!("Switching from E-Reading to {:?}", restored);
+            info!("switching from e-reading to {:?}", restored);
             restored
         } else {
             // Enter e-reading
-            println!("Switching to E-Reading");
+            info!("switching to e-reading");
             Box::new(EReadingMode::from_state())
         };
 
