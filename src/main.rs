@@ -43,6 +43,9 @@ pub enum ControllerError {
 
     #[error("Failed to get current mode")]
     ModeNotDetected,
+
+    #[error("Failed to set dimming (error code: {0})")]
+    DimmingFailed(i64),
 }
 
 // =============================================================================
@@ -57,6 +60,7 @@ static MANUAL_SLIDER: AtomicI32 = AtomicI32::new(50); // Default middle
 static EYECARE_SLIDER: AtomicI32 = AtomicI32::new(2); // Default level
 static EREADING_GRAYSCALE: AtomicI32 = AtomicI32::new(3); // Default grayscale 3
 static EREADING_TEMP: AtomicI32 = AtomicI32::new(562); // Default temp
+static CURRENT_DIMMING: AtomicI32 = AtomicI32::new(-1); // Dimming level (40-100)
 
 extern "C" fn mode_callback(func: i32, data: i32, str_data: *const i8) {
     let s = if str_data.is_null() {
@@ -74,8 +78,13 @@ extern "C" fn mode_callback(func: i32, data: i32, str_data: *const i8) {
     match func {
         // Mode info callback
         18 => {
-            // Parse "0_1_0_1_1,70,0" -> monochrome is the 3rd field
+            // Parse "0_1_0_1_1,70,0" -> dimming is 2nd field, monochrome is 3rd field
             let parts: Vec<&str> = s.split(',').collect();
+            if parts.len() >= 2 {
+                if let Ok(dimming) = parts[1].parse::<i32>() {
+                    CURRENT_DIMMING.store(dimming, Ordering::SeqCst);
+                }
+            }
             if parts.len() >= 3 {
                 if let Ok(mono) = parts[2].parse::<i32>() {
                     IS_MONOCHROME.store(mono != 0, Ordering::SeqCst);
@@ -84,8 +93,9 @@ extern "C" fn mode_callback(func: i32, data: i32, str_data: *const i8) {
             CURRENT_MODE.store(data, Ordering::SeqCst);
 
             println!(
-                "Mode updated: data={}, monochrome={}",
+                "Mode updated: data={}, dimming={}, monochrome={}",
                 data,
+                CURRENT_DIMMING.load(Ordering::SeqCst),
                 IS_MONOCHROME.load(Ordering::SeqCst)
             );
         }
@@ -407,6 +417,101 @@ impl AsusController {
         self.call_rpc_get(b"MyOptGetSplendidMonochromeFunc")?;
         Ok(())
     }
+
+    /// Sync all slider values from ASUS hardware
+    /// This fetches: dimming (via mode callback), manual slider, eyecare slider, and e-reading values
+    pub fn sync_all_sliders(&self) -> Result<(), ControllerError> {
+        println!("Syncing all sliders from ASUS...");
+
+        // 1. Get current mode - this also fetches dimming value via func=18 callback
+        let _ = self.get_current_mode();
+
+        // 2. Refresh all other sliders
+        self.refresh_sliders()?;
+
+        // Wait for callbacks
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        println!("Sync complete:");
+        println!(
+            "  Dimming: {} (splendid) / {}%",
+            CURRENT_DIMMING.load(Ordering::SeqCst),
+            Self::dimming_to_percent(CURRENT_DIMMING.load(Ordering::SeqCst))
+        );
+        println!("  Manual slider: {}", MANUAL_SLIDER.load(Ordering::SeqCst));
+        println!(
+            "  EyeCare slider: {}",
+            EYECARE_SLIDER.load(Ordering::SeqCst)
+        );
+        println!(
+            "  E-reading: grayscale={}, temp={}",
+            EREADING_GRAYSCALE.load(Ordering::SeqCst),
+            EREADING_TEMP.load(Ordering::SeqCst)
+        );
+        Ok(())
+    }
+
+    // =========================================================================
+    // Dimming
+    // =========================================================================
+
+    /// Convert dimming from splendid units (40-100) to percentage (0-100)
+    pub fn dimming_to_percent(splendid_value: i32) -> i32 {
+        let clamped = splendid_value.clamp(40, 100);
+        ((clamped - 40) as f32 / 60.0 * 100.0).round() as i32
+    }
+
+    /// Convert dimming from percentage (0-100) to splendid units (40-100)
+    pub fn percent_to_dimming(percent: i32) -> i32 {
+        40 + (percent as f32 / 100.0 * 60.0).round() as i32
+    }
+
+    /// Set the display dimming level
+    /// Value range: 40 (dimmest) to 100 (full brightness)
+    pub fn set_dimming(&self, level: i32) -> Result<(), ControllerError> {
+        let level = level.clamp(40, 100);
+        unsafe {
+            type SetDimmingFn = unsafe extern "C" fn(i32, *const i8, *mut c_void) -> i64;
+            let set_dimming: Symbol<SetDimmingFn> = self.lib.get(b"MyOptSetSplendidDimmingFunc")?;
+
+            let empty_str = b"\0".as_ptr() as *const i8;
+            let result = set_dimming(level, empty_str, self.client);
+            println!("Set dimming to {}, result: {}", level, result);
+
+            if result == 0 {
+                CURRENT_DIMMING.store(level, Ordering::SeqCst);
+                Ok(())
+            } else {
+                Err(ControllerError::DimmingFailed(result))
+            }
+        }
+    }
+
+    /// Set dimming using percentage (0-100)
+    pub fn set_dimming_percent(&self, percent: i32) -> Result<(), ControllerError> {
+        let splendid_value = Self::percent_to_dimming(percent.clamp(0, 100));
+        self.set_dimming(splendid_value)
+    }
+
+    /// Get the current dimming level (from cached state)
+    /// Returns the dimming value (40-100) or -1 if unknown
+    pub fn get_dimming(&self) -> i32 {
+        CURRENT_DIMMING.load(Ordering::SeqCst)
+    }
+
+    /// Get dimming as percentage (0-100)
+    /// Returns -1 if dimming hasn't been synced yet
+    pub fn get_dimming_percent(&self) -> i32 {
+        let dimming = CURRENT_DIMMING.load(Ordering::SeqCst);
+        if dimming < 40 {
+            return -1;
+        }
+        Self::dimming_to_percent(dimming)
+    }
+
+    // =========================================================================
+    // Mode Management
+    // =========================================================================
 
     /// Get the current display mode
     pub fn get_current_mode(&self) -> Result<Box<dyn DisplayMode>, ControllerError> {
