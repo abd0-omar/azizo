@@ -1,3 +1,9 @@
+# demo
+
+the display changes are not visible in the gif, but trust me it works
+
+![azizo_XEubVODtsn](https://github.com/user-attachments/assets/cdd16c8a-1794-4112-b22d-cbf8f4ef8314)
+
 # azizo-core
 
 Unofficial Rust API for ASUS Splendid display control on Windows.
