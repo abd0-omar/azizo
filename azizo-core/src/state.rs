@@ -18,8 +18,8 @@ pub struct ControllerState {
     pub eyecare_level: u8,
     /// E-reading grayscale level (1-5).
     pub ereading_grayscale: u8,
-    /// E-reading temperature value.
-    pub ereading_temp: u8,
+    /// E-reading temperature value (-50 to +50, 0 is neutral).
+    pub ereading_temp: i8,
     /// The last non-e-reading mode ID (for restoration).
     pub last_non_ereading_mode: i32,
 }

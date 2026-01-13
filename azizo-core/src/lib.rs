@@ -122,7 +122,7 @@ mod tests {
             manual_slider: 75,
             eyecare_level: 3,
             ereading_grayscale: 3,
-            ereading_temp: 60,
+            ereading_temp: 10,
             ..Default::default()
         };
 
@@ -134,6 +134,6 @@ mod tests {
 
         let ereading = EReadingMode::from_controller_state(&state);
         assert_eq!(ereading.grayscale, 3);
-        assert_eq!(ereading.temp, 60);
+        assert_eq!(ereading.temp, 10);
     }
 }

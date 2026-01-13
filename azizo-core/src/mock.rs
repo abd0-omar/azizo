@@ -35,7 +35,7 @@ impl MockController {
                 manual_slider: 50,
                 eyecare_level: 2,
                 ereading_grayscale: 4,
-                ereading_temp: 50,
+                ereading_temp: 0,
                 last_non_ereading_mode: 1,
             }),
         }

@@ -67,7 +67,7 @@ mod callback_state {
     static MANUAL_SLIDER: AtomicI32 = AtomicI32::new(50);
     static EYECARE_SLIDER: AtomicI32 = AtomicI32::new(2);
     static EREADING_GRAYSCALE: AtomicI32 = AtomicI32::new(4);
-    static EREADING_TEMP: AtomicI32 = AtomicI32::new(562);
+    static EREADING_TEMP: AtomicI32 = AtomicI32::new(0);
     static CURRENT_DIMMING: AtomicI32 = AtomicI32::new(-1);
 
     pub(super) fn snapshot() -> ControllerState {
@@ -78,7 +78,7 @@ mod callback_state {
             manual_slider: MANUAL_SLIDER.load(Ordering::SeqCst) as u8,
             eyecare_level: EYECARE_SLIDER.load(Ordering::SeqCst) as u8,
             ereading_grayscale: EREADING_GRAYSCALE.load(Ordering::SeqCst) as u8,
-            ereading_temp: EREADING_TEMP.load(Ordering::SeqCst) as u8,
+            ereading_temp: EREADING_TEMP.load(Ordering::SeqCst) as i8,
             last_non_ereading_mode: LAST_NON_EREADING_MODE.load(Ordering::SeqCst),
         }
     }
@@ -138,15 +138,10 @@ mod callback_state {
                 let raw = data + 206;
                 let grayscale = raw / 256;
                 let temp = raw % 256;
-                // Convert from hardware 0-4 to user-facing 1-5
-                EREADING_GRAYSCALE.store(grayscale + 1, Ordering::SeqCst);
+                // Hardware uses 1-5 directly, no conversion needed
+                EREADING_GRAYSCALE.store(grayscale, Ordering::SeqCst);
                 EREADING_TEMP.store(temp, Ordering::SeqCst);
-                debug!(
-                    "e-reading updated: grayscale={} (stored as {}), temp={}",
-                    grayscale,
-                    grayscale + 1,
-                    temp
-                );
+                debug!("e-reading updated: grayscale={}, temp={}", grayscale, temp);
             }
             _ => {}
         }
@@ -269,7 +264,8 @@ impl AsusController {
     /// Set monochrome/e-reading mode with grayscale and temp.
     ///
     /// This is used internally by [`EReadingMode`].
-    pub fn set_monochrome_mode(&self, grayscale: u8, temp: u8) -> Result<(), ControllerError> {
+    /// Temperature is -50 to +50 (0 is neutral).
+    pub fn set_monochrome_mode(&self, grayscale: u8, temp: i8) -> Result<(), ControllerError> {
         unsafe {
             type SetMonoFn = unsafe extern "C" fn(i32, *mut c_void) -> i64;
             let set_mono: Symbol<SetMonoFn> = self.lib.get(b"MyOptSetSplendidMonochromeFunc")?;

@@ -8,6 +8,9 @@ use iced::keyboard::{self, Event as KeyboardEvent, Key};
 use iced::widget::{button, column, container, row, slider, text, toggler};
 use iced::{Element, Subscription, Task, Theme};
 
+mod toast;
+use toast::{Status, Toast};
+
 pub fn main() -> iced::Result {
     iced::application(AzizoApp::default, AzizoApp::update, AzizoApp::view)
         .title("Azizo - ASUS Display Control")
@@ -38,6 +41,9 @@ struct AzizoApp {
     eyecare_level: i32,
     ereading_grayscale: i32,
     ereading_temp: i32,
+
+    // Toasts
+    toasts: Vec<Toast>,
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +68,9 @@ enum Message {
 
     // Keyboard event
     KeyboardEvent(KeyboardEvent),
+
+    // Toast
+    CloseToast(usize),
 }
 
 impl Default for AzizoApp {
@@ -72,10 +81,11 @@ impl Default for AzizoApp {
             dimming_percent: 100,
             current_mode: ModeType::Normal,
             is_ereading: false,
-            manual_value: 50,
+            manual_value: 0, // UI uses -50 to +50, hardware uses 0-100
             eyecare_level: 2,
-            ereading_grayscale: 3,
-            ereading_temp: 60,
+            ereading_grayscale: 4,
+            ereading_temp: 0,
+            toasts: Vec::new(),
         };
 
         // Try to initialize controller
@@ -89,7 +99,7 @@ impl Default for AzizoApp {
                 } else {
                     let state = controller.get_state();
                     app.dimming_percent = AsusController::dimming_to_percent(state.dimming);
-                    app.manual_value = state.manual_slider as i32;
+                    app.manual_value = state.manual_slider as i32 - 50; // Convert hardware 0-100 to UI -50 to +50
                     app.eyecare_level = state.eyecare_level as i32;
                     app.ereading_grayscale = state.ereading_grayscale as i32;
                     app.ereading_temp = state.ereading_temp as i32;
@@ -117,11 +127,19 @@ impl Default for AzizoApp {
 }
 
 impl AzizoApp {
+    fn add_toast(&mut self, title: impl Into<String>, body: impl Into<String>, status: Status) {
+        self.toasts.push(Toast {
+            title: title.into(),
+            body: body.into(),
+            status,
+        });
+    }
+
     fn update(&mut self, message: Message) -> Task<Message> {
         // Clear previous errors on new actions
         if !matches!(
             message,
-            Message::SyncFromHardware | Message::KeyboardEvent(_)
+            Message::SyncFromHardware | Message::KeyboardEvent(_) | Message::CloseToast(_)
         ) {
             self.error_message = None;
         }
@@ -152,7 +170,8 @@ impl AzizoApp {
                     let result: Result<(), ControllerError> = match mode {
                         ModeType::Normal => controller.set_mode(&NormalMode::new()),
                         ModeType::Vivid => controller.set_mode(&VividMode::new()),
-                        ModeType::Manual => match ManualMode::new(self.manual_value as u8) {
+                        ModeType::Manual => match ManualMode::new((self.manual_value + 50) as u8) {
+                            // Convert UI -50 to +50 to hardware 0-100
                             Ok(m) => controller.set_mode(&m),
                             Err(e) => Err(e),
                         },
@@ -174,7 +193,7 @@ impl AzizoApp {
                         // Enable e-reading
                         match EReadingMode::new(
                             self.ereading_grayscale as u8,
-                            self.ereading_temp as u8,
+                            self.ereading_temp as i8,
                         ) {
                             Ok(mode) => {
                                 if let Err(e) = controller.set_mode(&mode) {
@@ -198,7 +217,8 @@ impl AzizoApp {
                 self.manual_value = value;
                 if self.current_mode == ModeType::Manual {
                     if let Some(ref controller) = self.controller {
-                        if let Ok(mode) = ManualMode::new(value as u8) {
+                        // Convert UI -50 to +50 to hardware 0-100
+                        if let Ok(mode) = ManualMode::new((value + 50) as u8) {
                             if let Err(e) = controller.set_mode(&mode) {
                                 self.error_message = Some(format!("Manual error: {}", e));
                             }
@@ -224,7 +244,7 @@ impl AzizoApp {
                 self.ereading_grayscale = value;
                 if self.is_ereading {
                     if let Some(ref controller) = self.controller {
-                        if let Ok(mode) = EReadingMode::new(value as u8, self.ereading_temp as u8) {
+                        if let Ok(mode) = EReadingMode::new(value as u8, self.ereading_temp as i8) {
                             if let Err(e) = controller.set_mode(&mode) {
                                 self.error_message = Some(format!("E-Reading error: {}", e));
                             }
@@ -238,7 +258,7 @@ impl AzizoApp {
                 if self.is_ereading {
                     if let Some(ref controller) = self.controller {
                         if let Ok(mode) =
-                            EReadingMode::new(self.ereading_grayscale as u8, value as u8)
+                            EReadingMode::new(self.ereading_grayscale as u8, value as i8)
                         {
                             if let Err(e) = controller.set_mode(&mode) {
                                 self.error_message = Some(format!("E-Reading error: {}", e));
@@ -255,7 +275,7 @@ impl AzizoApp {
                             let state = controller.get_state();
                             self.dimming_percent =
                                 AsusController::dimming_to_percent(state.dimming);
-                            self.manual_value = state.manual_slider as i32;
+                            self.manual_value = state.manual_slider as i32 - 50; // Convert hardware 0-100 to UI -50 to +50
                             self.eyecare_level = state.eyecare_level as i32;
                             self.ereading_grayscale = state.ereading_grayscale as i32;
                             self.ereading_temp = state.ereading_temp as i32;
@@ -268,7 +288,11 @@ impl AzizoApp {
                                 7 => ModeType::EyeCare,
                                 _ => ModeType::Normal,
                             };
-                            self.error_message = Some("Synced!".to_string());
+                            self.add_toast(
+                                "Synced!",
+                                "Hardware state synchronized",
+                                Status::Success,
+                            );
                         }
                         Err(e) => {
                             self.error_message = Some(format!("Sync error: {}", e));
@@ -297,6 +321,12 @@ impl AzizoApp {
                             _ => {}
                         }
                     }
+                }
+            }
+
+            Message::CloseToast(index) => {
+                if index < self.toasts.len() {
+                    self.toasts.remove(index);
                 }
             }
         }
@@ -334,7 +364,7 @@ impl AzizoApp {
         let manual_section = if self.current_mode == ModeType::Manual {
             column![
                 text(format!("Manual Temperature: {}", self.manual_value)).size(14),
-                slider(0..=100, self.manual_value, Message::ManualSliderChanged).step(1),
+                slider(-50..=50, self.manual_value, Message::ManualSliderChanged).step(1),
             ]
             .spacing(5)
         } else {
@@ -364,13 +394,13 @@ impl AzizoApp {
             column![
                 text(format!("Grayscale: {}", self.ereading_grayscale)).size(14),
                 slider(
-                    0..=4,
+                    1..=5,
                     self.ereading_grayscale,
                     Message::EReadingGrayscaleChanged
                 )
                 .step(1),
                 text(format!("Temperature: {}", self.ereading_temp)).size(14),
-                slider(0..=100, self.ereading_temp, Message::EReadingTempChanged).step(1),
+                slider(-50..=50, self.ereading_temp, Message::EReadingTempChanged).step(1),
             ]
             .spacing(5)
         } else {
@@ -401,7 +431,10 @@ impl AzizoApp {
         .spacing(15)
         .padding(20);
 
-        container(content).into()
+        // Wrap content with toast manager
+        toast::Manager::new(container(content), &self.toasts, Message::CloseToast)
+            .timeout(3)
+            .into()
     }
 
     fn subscription(&self) -> Subscription<Message> {
