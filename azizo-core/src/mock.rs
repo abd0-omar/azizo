@@ -14,7 +14,7 @@ use std::sync::Mutex;
 /// # Example
 ///
 /// ```
-/// use asus_display_control::{MockController, DisplayController, NormalMode};
+/// use azizo_core::{MockController, DisplayController, NormalMode};
 ///
 /// let mock = MockController::new();
 /// mock.set_mode(&NormalMode::new()).unwrap();
@@ -34,7 +34,7 @@ impl MockController {
                 dimming: 70,
                 manual_slider: 50,
                 eyecare_level: 2,
-                ereading_grayscale: 3,
+                ereading_grayscale: 4,
                 ereading_temp: 50,
                 last_non_ereading_mode: 1,
             }),

@@ -200,7 +200,7 @@ impl DisplayMode for EyeCareMode {
 /// E-Reading display mode - grayscale with adjustable temperature.
 #[derive(Debug, Clone, Copy)]
 pub struct EReadingMode {
-    /// Grayscale level (0-4, maps to 1-5 internally).
+    /// Grayscale level (1-5).
     pub grayscale: u8,
     /// Temperature value.
     pub temp: u8,
@@ -210,18 +210,18 @@ impl EReadingMode {
     /// Create a new E-Reading mode.
     ///
     /// # Arguments
-    /// * `grayscale` - Grayscale level (0-4)
+    /// * `grayscale` - Grayscale level (1-5)
     /// * `temp` - Temperature value
     ///
     /// # Errors
-    /// Returns an error if grayscale > 4.
+    /// Returns an error if grayscale is not in range 1-5.
     pub fn new(grayscale: u8, temp: u8) -> Result<Self, ControllerError> {
-        if grayscale > 4 {
+        if grayscale < 1 || grayscale > 5 {
             return Err(ControllerError::InvalidSliderValue {
                 mode: "EReading grayscale",
                 value: grayscale,
-                min: 0,
-                max: 4,
+                min: 1,
+                max: 5,
             });
         }
         Ok(Self { grayscale, temp })
@@ -238,7 +238,8 @@ impl EReadingMode {
 
 impl DisplayMode for EReadingMode {
     fn apply(&self, controller: &AsusController) -> Result<(), ControllerError> {
-        controller.set_monochrome_mode(self.grayscale, self.temp)
+        // Convert from user-facing 1-5 to hardware 0-4
+        controller.set_monochrome_mode(self.grayscale - 1, self.temp)
     }
 
     fn symbol(&self) -> &'static [u8] {

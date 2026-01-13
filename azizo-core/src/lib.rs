@@ -121,7 +121,7 @@ mod tests {
         let state = ControllerState {
             manual_slider: 75,
             eyecare_level: 3,
-            ereading_grayscale: 2,
+            ereading_grayscale: 3,
             ereading_temp: 60,
             ..Default::default()
         };
@@ -133,7 +133,7 @@ mod tests {
         assert_eq!(eyecare.level, 3);
 
         let ereading = EReadingMode::from_controller_state(&state);
-        assert_eq!(ereading.grayscale, 2);
+        assert_eq!(ereading.grayscale, 3);
         assert_eq!(ereading.temp, 60);
     }
 }

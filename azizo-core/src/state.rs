@@ -16,7 +16,7 @@ pub struct ControllerState {
     pub manual_slider: u8,
     /// Eye care mode level (0-4).
     pub eyecare_level: u8,
-    /// E-reading grayscale level (0-4).
+    /// E-reading grayscale level (1-5).
     pub ereading_grayscale: u8,
     /// E-reading temperature value.
     pub ereading_temp: u8,

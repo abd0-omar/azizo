@@ -66,7 +66,7 @@ mod callback_state {
 
     static MANUAL_SLIDER: AtomicI32 = AtomicI32::new(50);
     static EYECARE_SLIDER: AtomicI32 = AtomicI32::new(2);
-    static EREADING_GRAYSCALE: AtomicI32 = AtomicI32::new(3);
+    static EREADING_GRAYSCALE: AtomicI32 = AtomicI32::new(4);
     static EREADING_TEMP: AtomicI32 = AtomicI32::new(562);
     static CURRENT_DIMMING: AtomicI32 = AtomicI32::new(-1);
 
@@ -138,9 +138,15 @@ mod callback_state {
                 let raw = data + 206;
                 let grayscale = raw / 256;
                 let temp = raw % 256;
-                EREADING_GRAYSCALE.store(grayscale, Ordering::SeqCst);
+                // Convert from hardware 0-4 to user-facing 1-5
+                EREADING_GRAYSCALE.store(grayscale + 1, Ordering::SeqCst);
                 EREADING_TEMP.store(temp, Ordering::SeqCst);
-                debug!("e-reading updated: grayscale={}, temp={}", grayscale, temp);
+                debug!(
+                    "e-reading updated: grayscale={} (stored as {}), temp={}",
+                    grayscale,
+                    grayscale + 1,
+                    temp
+                );
             }
             _ => {}
         }
@@ -164,11 +170,11 @@ static INSTANCE_EXISTS: AtomicBool = AtomicBool::new(false);
 /// # Example
 ///
 /// ```no_run
-/// use asus_display_control::{AsusController, DisplayController, NormalMode};
+/// use azizo_core::{AsusController, DisplayController, NormalMode};
 ///
 /// let controller = AsusController::new()?;
 /// controller.set_mode(&NormalMode::new())?;
-/// # Ok::<(), asus_display_control::ControllerError>(())
+/// # Ok::<(), azizo_core::ControllerError>(())
 /// ```
 ///
 /// # Limitations
@@ -363,6 +369,8 @@ impl DisplayController for AsusController {
     }
 
     fn set_dimming_percent(&self, percent: i32) -> Result<(), ControllerError> {
+        // Enforce 10% increments
+        let percent = (percent as f32 / 10.0).round() as i32 * 10;
         let splendid_value = Self::percent_to_dimming(percent.clamp(0, 100));
         self.set_dimming(splendid_value)
     }
