@@ -6,7 +6,7 @@ the display changes are not visible in the gif, but trust me it works
 
 # azizo-core
 
-Unofficial Rust API for ASUS Splendid display control on Windows.
+Unofficial reversed engineered Rust API for ASUS Splendid display control on Windows.
 
 ## Requirements
 
